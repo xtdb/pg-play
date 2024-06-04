@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  HostedZoneId:
+    Type: 'String'
+    Description: 'The zone id for the hosted zone'
+  HostedZoneName:
+    Type: 'String'
+    Description: 'The zone name for the hosted zone'
+
+Resources:
+  # >> VPC
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: 'pg-play'
+
+  SSMVPC:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: 'pg-play--vpc-id'
+      Value: !Ref VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.11.0/24
+      MapPublicIpOnLaunch: true
+
+  SSMPublicSubnetOne:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: 'pg-play--public-subnet-1'
+      Value: !Ref PublicSubnetOne
+
+  PublicSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.12.0/24
+      MapPublicIpOnLaunch: true
+
+  SSMPublicSubnetTwo:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: 'pg-play--public-subnet-2'
+      Value: !Ref PublicSubnetTwo
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetOne
+
+  PublicSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetTwo
+
+  # >> Domain
+
+  DomainRecord:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      Name: !Sub
+        - 'pg.${Domain}.'
+        - Domain: !Ref HostedZoneName
+      HostedZoneId: !Ref HostedZoneId
+      Type: 'A'
+      AliasTarget:
+        DNSName: !GetAtt PgwireEcsLb.DNSName
+        HostedZoneId: !GetAtt PgwireEcsLb.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+  # >> Security Group
+
+  SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Security group allowing ingress/egress for all
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
+
+  SelfIngressAllowRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref SecurityGroup
+
+  # >> Pgwire Load Balancer
+
+  PgwireEcsLb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: PgwireEcsLb
+      Type: network
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnetOne
+        - !Ref PublicSubnetTwo
+      SecurityGroups:
+        - !Ref SecurityGroup
+
+  PgwireEcsTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    DependsOn: PgwireEcsLb
+    Properties:
+      Name: PgwireEcsTargetGroup
+      Port: 5432
+      Protocol: TCP
+      VpcId: !Ref VPC
+      TargetType: ip
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '20'
+
+  PgwireLbListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      LoadBalancerArn: !Ref PgwireEcsLb
+      Port: 5432
+      Protocol: TCP
+
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref PgwireEcsTargetGroup
+
+  PgwireSsmEcsTargetGroup:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: 'pg-play--pgwire-target-group-arn'
+      Value: !Ref PgwireEcsTargetGroup
+
+  # >> ECS Service
+
+  TaskSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Security group allowing access to container
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
+
+  SSMECSTaskSecurityGroup:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: 'pg-play--task-security-group'
+      Value: !Ref TaskSecurityGroup
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: 'pg-play'
+
+  SSMECSCluster:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: 'pg-play--ecs-cluster'
+      Value: !Ref ECSCluster
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: 'pg-play'
+      RetentionInDays: 365
+
+  SSMLogGroup:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: 'pg-play--log-group'
+      Value: !Ref LogGroup
+
+  TaskExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'ecs-tasks.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  SSMTaskExecutionRole:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: 'pg-play--task-execution-role-arn'
+      Value: !GetAtt TaskExecutionRole.Arn
+
+  TaskRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'ecs-tasks.amazonaws.com'
+            Action: 'sts:AssumeRole'
+
+  SSMTaskRole:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: 'pg-play--task-role-arn'
+      Value: !GetAtt TaskRole.Arn
+
+  ContainerRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: pg-play
+
+  SSMContainerRepoRepoUri:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: 'pg-play--container-repo-repo-uri'
+      Value: !GetAtt ContainerRepo.RepositoryUri

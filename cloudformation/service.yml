@@ -1,0 +1,57 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  DockerTag:
+    Type: 'String'
+    Default: 'latest'
+
+Resources:
+  TaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: 'pg-play'
+      RequiresCompatibilities:
+        - 'FARGATE'
+      NetworkMode: 'awsvpc'
+
+      Cpu: '1024'
+      Memory: '4096'
+      ExecutionRoleArn: '{{resolve:ssm:pg-play--task-execution-role-arn}}'
+      TaskRoleArn: '{{resolve:ssm:pg-play--task-role-arn}}'
+
+      ContainerDefinitions:
+        - Name: 'pg-play'
+          Image: !Join [":", ['{{resolve:ssm:pg-play--container-repo-repo-uri}}', !Ref DockerTag]]
+          Essential: true
+          PortMappings:
+            - ContainerPort: 5432
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: '{{resolve:ssm:pg-play--log-group}}'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: pg-play
+
+  ECSService:
+    Type: 'AWS::ECS::Service'
+    Properties:
+      Cluster: '{{resolve:ssm:pg-play--ecs-cluster}}'
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: 'FARGATE'
+
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds: 120
+
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: 'ENABLED'
+          SecurityGroups:
+            - '{{resolve:ssm:pg-play--task-security-group}}'
+          Subnets:
+            - '{{resolve:ssm:pg-play--public-subnet-1}}'
+            - '{{resolve:ssm:pg-play--public-subnet-2}}'
+      LoadBalancers:
+        - ContainerName: pg-play
+          ContainerPort: 5432
+          TargetGroupArn: '{{resolve:ssm:pg-play--pgwire-target-group-arn}}'
